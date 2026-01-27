@@ -8,8 +8,8 @@ class Settings:
     OUTDIR: str = "baseline_outputs"
 
     # Model selection
-    K_MIN: int = 2
-    K_MAX: int = 15
+    K_MIN: int = 3
+    K_MAX: int = 10
     COV_TYPE: str = "diag"
     N_INIT: int = 10
     MAX_ITER: int = 300
