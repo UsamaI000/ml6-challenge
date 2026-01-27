@@ -18,15 +18,15 @@ class Settings:
     RANDOM_SEED: int = 42
 
     # Operational gates
-    CONF_THRESH: float = 0.90
-    MIN_SUPPORT: int = 5
+    CONF_THRESH: float = 0.85
+    MIN_SUPPORT: int = 3
     MIN_PURITY: float = 0.85
 
     # Self-training (Option A)
     SELF_TRAIN: bool = True
     SELF_TRAIN_ITERS: int = 5              # max iterations
-    PSEUDO_CONF_THRESH: float = 0.95      # stricter than CONF_THRESH
-    PSEUDO_MAX_PER_ITER: int = 250         # cap to limit drift
+    PSEUDO_CONF_THRESH: float = 0.97      # stricter than CONF_THRESH
+    PSEUDO_MAX_PER_ITER: int = 150         # cap to limit drift
     PSEUDO_REQUIRE_RELIABLE_CLUSTER: bool = True
 
 SETTINGS = Settings()

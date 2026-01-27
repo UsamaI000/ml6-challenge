@@ -17,8 +17,10 @@ from sklearn.metrics import (
     adjusted_rand_score,
     normalized_mutual_info_score,
     silhouette_score,
+    f1_score,
 )
 from sklearn.decomposition import PCA
+from sklearn.model_selection import RepeatedStratifiedKFold
 
 from config import SETTINGS
 
@@ -77,7 +79,7 @@ def cluster_label_mapping(cluster_ids: np.ndarray, y: pd.Series, labeled_mask: p
             cluster_to_label[c] = None
             purity[c] = None
         else:
-            # NOTE: this assumes labels are numeric. If your labels are strings, remove astype(int).
+            # NOTE: assumes labels are numeric. If your labels are strings, remove astype(int).
             lbls = y_vals[idx].astype(int)
             vals, cnts = np.unique(lbls, return_counts=True)
             maj = int(vals[np.argmax(cnts)])
@@ -221,6 +223,7 @@ def select_pseudo_labels(
     pred_class: pd.Series,
     max_prob: np.ndarray,
     reliable_mask_all: np.ndarray,
+    exclude_mask: pd.Series | None = None,  # NEW for CV leakage control
 ):
     """
     Choose a capped set of high-confidence pseudo-labels from UNLABELED points only.
@@ -233,6 +236,10 @@ def select_pseudo_labels(
     cand = unlabeled_mask & pred_class.notna() & (max_prob >= SETTINGS.PSEUDO_CONF_THRESH)
     if SETTINGS.PSEUDO_REQUIRE_RELIABLE_CLUSTER:
         cand = cand & reliable_mask_all
+
+    # NEW: never pseudo-label excluded points (e.g., CV test fold)
+    if exclude_mask is not None:
+        cand = cand & (~exclude_mask)
 
     cand_idx = np.where(cand.values)[0]
     if len(cand_idx) == 0:
@@ -251,6 +258,236 @@ def select_pseudo_labels(
     # NOTE: assumes numeric labels
     pseudo_labels.iloc[take] = pred_class.iloc[take].astype(int).values
     return pseudo_mask, pseudo_labels
+
+
+def run_self_training_mapping(
+    df: pd.DataFrame,
+    cluster_ids: np.ndarray,
+    max_prob: np.ndarray,
+    y_true: pd.Series,
+    labeled_train_mask: pd.Series,  # only TRUE labels available for this run/split
+    K: int,
+    exclude_from_pseudo: pd.Series | None = None,  # e.g. CV test fold
+    reliability_from_true_only: bool = True,  # recommended
+):
+    """
+    Self-training loop that returns a cluster->label mapping without leaking held-out labels.
+
+    Returns:
+      cluster_to_label_ext  (mapping possibly refined with pseudo labels)
+      support_true, purity_true  (computed only from labeled_train_mask)
+      reliable_mask_all  (boolean mask over ALL rows, based on true-only reliability if enabled)
+      history_df
+    """
+    # y_ext starts with only train true labels; everything else unknown
+    y_ext = y_true.copy()
+    y_ext.loc[~labeled_train_mask] = np.nan
+    labeled_ext = labeled_train_mask.copy()
+
+    # initial mapping from train true labels
+    cluster_to_label_ext, support_ext, purity_ext = cluster_label_mapping(cluster_ids, y_ext, labeled_ext, K)
+
+    # true-only stats for reliability (kept fixed if reliability_from_true_only=True)
+    cluster_to_label_true, support_true, purity_true = cluster_label_mapping(cluster_ids, y_true, labeled_train_mask, K)
+
+    def reliable_mask_all_from(support, purity):
+        reliable_cluster = compute_reliable_cluster(support, purity, K)
+        return reliable_cluster[cluster_ids]
+
+    history_rows = []
+
+    if getattr(SETTINGS, "SELF_TRAIN", False) and int(getattr(SETTINGS, "SELF_TRAIN_ITERS", 0)) > 0:
+        for it in range(int(getattr(SETTINGS, "SELF_TRAIN_ITERS", 0))):
+            pred_class = pd.Series(cluster_ids).map(cluster_to_label_ext)
+
+            rel_mask_all = (
+                reliable_mask_all_from(support_true, purity_true)
+                if reliability_from_true_only
+                else reliable_mask_all_from(support_ext, purity_ext)
+            )
+
+            pseudo_mask, pseudo_labels = select_pseudo_labels(
+                df=df,
+                labeled_mask=labeled_ext,
+                pred_class=pred_class,
+                max_prob=max_prob,
+                reliable_mask_all=rel_mask_all,
+                exclude_mask=exclude_from_pseudo,
+            )
+
+            n_new = int(pseudo_mask.sum())
+            before = int(labeled_ext.sum())
+
+            if n_new == 0:
+                history_rows.append(
+                    {
+                        "iter": it,
+                        "pseudo_added": 0,
+                        "labeled_ext_total_before": before,
+                        "labeled_ext_total_after": before,
+                    }
+                )
+                break
+
+            pseudo_idx = df.index[pseudo_mask]
+
+            # add pseudo labels (SAFE indexing)
+            y_ext.loc[pseudo_idx] = pseudo_labels.loc[pseudo_idx].astype(int).values
+            labeled_ext.loc[pseudo_idx] = True
+
+            after = int(labeled_ext.sum())
+            history_rows.append(
+                {
+                    "iter": it,
+                    "pseudo_added": n_new,
+                    "labeled_ext_total_before": before,
+                    "labeled_ext_total_after": after,
+                }
+            )
+
+            # recompute mapping using expanded labeled pool (true + pseudo)
+            cluster_to_label_ext, support_ext, purity_ext = cluster_label_mapping(cluster_ids, y_ext, labeled_ext, K)
+
+            # keep true reliability fixed (train labels only)
+            if reliability_from_true_only:
+                cluster_to_label_true, support_true, purity_true = cluster_label_mapping(
+                    cluster_ids, y_true, labeled_train_mask, K
+                )
+
+    final_rel_mask_all = (
+        reliable_mask_all_from(support_true, purity_true)
+        if reliability_from_true_only
+        else reliable_mask_all_from(support_ext, purity_ext)
+    )
+
+    return cluster_to_label_ext, support_true, purity_true, final_rel_mask_all, pd.DataFrame(history_rows)
+
+
+def repeated_kfold_cv_self_train(
+    df: pd.DataFrame,
+    preprocess,
+    gmm,
+    sensor_cols: list[str],
+    outdir: str,
+):
+    """
+    Repeated stratified K-fold CV over the 40 TRUE labeled points.
+    Within each split: self-training runs using only train labels + unlabeled pool,
+    and pseudo-labeling is prevented on the held-out fold (leakage control).
+    """
+    Xp = preprocess.transform(df[sensor_cols])
+    cluster_ids = gmm.predict(Xp)
+    probs = gmm.predict_proba(Xp)
+    max_prob = probs.max(axis=1)
+    K = int(gmm.n_components)
+
+    y = df[SETTINGS.LABEL_COL]
+    labeled_mask = y.notna()
+
+    labeled_idx = np.where(labeled_mask.values)[0]
+    y_labeled = y.loc[labeled_mask].astype(int).values
+
+    # 40 labels with (20,10,10) -> 5-fold is safe
+    rskf = RepeatedStratifiedKFold(n_splits=5, n_repeats=10, random_state=SETTINGS.RANDOM_SEED)
+
+    rows = []
+    split_id = 0
+
+    for train_sub, test_sub in rskf.split(np.zeros_like(y_labeled), y_labeled):
+        split_id += 1
+
+        train_idx = labeled_idx[train_sub]
+        test_idx = labeled_idx[test_sub]
+
+        train_mask = pd.Series(False, index=df.index)
+        test_mask = pd.Series(False, index=df.index)
+        train_mask.iloc[train_idx] = True
+        test_mask.iloc[test_idx] = True
+
+        labeled_train_mask = train_mask & labeled_mask
+        exclude_from_pseudo = test_mask
+
+        cluster_to_label, support_true, purity_true, reliable_mask_all, hist = run_self_training_mapping(
+            df=df,
+            cluster_ids=cluster_ids,
+            max_prob=max_prob,
+            y_true=y,
+            labeled_train_mask=labeled_train_mask,
+            K=K,
+            exclude_from_pseudo=exclude_from_pseudo,
+            reliability_from_true_only=True,
+        )
+
+        pred_class = pd.Series(cluster_ids).map(cluster_to_label)
+
+        test_total = int((test_mask & labeled_mask).sum())
+        valid_test = test_mask & labeled_mask & pred_class.notna()
+
+        if valid_test.sum() == 0:
+            rows.append(
+                {
+                    "split": split_id,
+                    "test_n": test_total,
+                    "coverage_auto": 0.0,
+                    "acc_auto": np.nan,
+                    "acc_mapped": np.nan,
+                    "macro_f1_auto": np.nan,
+                    "auto_n": 0,
+                    "mapped_n": 0,
+                }
+            )
+            continue
+
+        y_test = y.loc[valid_test].astype(int).values
+        y_pred = pred_class.loc[valid_test].astype(int).values
+        acc_mapped = float((y_test == y_pred).mean())
+        mapped_n = int(valid_test.sum())
+
+        auto_test = valid_test & (max_prob >= SETTINGS.CONF_THRESH) & reliable_mask_all
+        auto_n = int(auto_test.sum())
+        coverage_auto = float(auto_n / test_total) if test_total > 0 else 0.0
+
+        if auto_n > 0:
+            y_auto = y.loc[auto_test].astype(int).values
+            y_auto_pred = pred_class.loc[auto_test].astype(int).values
+            acc_auto = float((y_auto == y_auto_pred).mean())
+            macro_f1_auto = float(f1_score(y_auto, y_auto_pred, average="macro"))
+        else:
+            acc_auto = np.nan
+            macro_f1_auto = np.nan
+
+        rows.append(
+            {
+                "split": split_id,
+                "test_n": test_total,
+                "coverage_auto": coverage_auto,
+                "acc_auto": acc_auto,
+                "acc_mapped": acc_mapped,
+                "macro_f1_auto": macro_f1_auto,
+                "auto_n": auto_n,
+                "mapped_n": mapped_n,
+            }
+        )
+
+    cv_df = pd.DataFrame(rows)
+    zero_auto_rate = float((cv_df["auto_n"] == 0).mean())
+    print("fraction_splits_with_zero_auto:", zero_auto_rate)
+    cv_df.to_csv(os.path.join(outdir, "cv_self_train_report.csv"), index=False)
+
+    summary = pd.Series(
+        {
+            "splits": len(cv_df),
+            "mean_coverage_auto": float(cv_df["coverage_auto"].mean()),
+            "std_coverage_auto": float(cv_df["coverage_auto"].std()),
+            "mean_acc_auto": float(cv_df["acc_auto"].mean(skipna=True)),
+            "std_acc_auto": float(cv_df["acc_auto"].std(skipna=True)),
+            "mean_acc_mapped": float(cv_df["acc_mapped"].mean(skipna=True)),
+            "std_acc_mapped": float(cv_df["acc_mapped"].std(skipna=True)),
+        }
+    )
+    summary.to_csv(os.path.join(outdir, "cv_self_train_summary.csv"))
+    print("\n[CV] Wrote:", os.path.join(outdir, "cv_self_train_report.csv"))
+    print(summary)
 
 
 def train():
@@ -288,17 +525,15 @@ def train():
     probs = gmm.predict_proba(Xp)
     max_prob = probs.max(axis=1)
 
-    # --- Initial mapping from TRUE labels only ---
+    # --- Production self-training (no CV holdout) ---
     cluster_to_label, support, purity = cluster_label_mapping(cluster_ids, y, labeled_mask, K)
 
-    # --- Self-training (Option A): expand labeled pool with strict pseudo-labels ---
     y_ext = y.copy()
     labeled_ext = labeled_mask.copy()
     pseudo_labeled = pd.Series(False, index=df.index)
 
     if getattr(SETTINGS, "SELF_TRAIN", False):
         history_rows = []
-
         for it in range(int(getattr(SETTINGS, "SELF_TRAIN_ITERS", 0))):
             pred_class = pd.Series(cluster_ids).map(cluster_to_label)
 
@@ -311,6 +546,7 @@ def train():
                 pred_class=pred_class,
                 max_prob=max_prob,
                 reliable_mask_all=reliable_mask_all,
+                exclude_mask=None,
             )
 
             n_new = int(pseudo_mask.sum())
@@ -320,34 +556,20 @@ def train():
 
             if n_new == 0:
                 history_rows.append(
-                    {
-                        "iter": it,
-                        "pseudo_added": 0,
-                        "labeled_ext_total_before": before,
-                        "labeled_ext_total_after": before,
-                    }
+                    {"iter": it, "pseudo_added": 0, "labeled_ext_total_before": before, "labeled_ext_total_after": before}
                 )
                 break
 
             pseudo_idx = df.index[pseudo_mask]
-
-            # Add pseudo-labels (SAFE indexing)
-            # NOTE: assumes numeric labels
             y_ext.loc[pseudo_idx] = pseudo_labels.loc[pseudo_idx].astype(int).values
             labeled_ext.loc[pseudo_idx] = True
             pseudo_labeled.loc[pseudo_idx] = True
 
             after = int(labeled_ext.sum())
             history_rows.append(
-                {
-                    "iter": it,
-                    "pseudo_added": n_new,
-                    "labeled_ext_total_before": before,
-                    "labeled_ext_total_after": after,
-                }
+                {"iter": it, "pseudo_added": n_new, "labeled_ext_total_before": before, "labeled_ext_total_after": after}
             )
 
-            # Recompute mapping with expanded labeled pool
             cluster_to_label, support, purity = cluster_label_mapping(cluster_ids, y_ext, labeled_ext, K)
 
         pd.DataFrame(history_rows).to_csv(os.path.join(outdir, "self_train_history.csv"), index=False)
@@ -377,7 +599,6 @@ def train():
     # evaluate on TRUE labeled only (avoid evaluating on pseudo labels)
     valid = labeled_mask & pred_class.notna()
     if valid.sum() > 0:
-        # NOTE: assumes numeric labels
         y_true = y[valid].astype(int).values
         y_pred = pred_class[valid].astype(int).values
         acc = accuracy_score(y_true, y_pred)
@@ -392,12 +613,12 @@ def train():
     review_rate = 1.0 - auto_rate
     print(f"Operational: auto_rate={auto_rate:.3f}, review_rate={review_rate:.3f}")
 
-    # stability (cluster assignment stability across seeds)
+    # stability
     stab = stability_ari(Xp, cluster_ids, K, runs=8)
     stab.to_csv(os.path.join(outdir, "stability_ari.csv"), index=False)
     plot_stability(stab, outdir)
 
-    # trade-off curve (based on TRUE labeled only)
+    # trade-off curve
     CONF_GRID = np.arange(0.55, 0.96, 0.05)
     trade_rows = []
     if valid.sum() > 0:
@@ -420,7 +641,7 @@ def train():
     if len(trade_df) > 0:
         plot_operational_tradeoff(trade_df, outdir)
 
-    # calibration (TRUE labeled only)
+    # calibration
     CAL_BINS = np.array([0.0, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
     if valid.sum() > 0:
         conf_l = max_prob[valid.values]
@@ -430,9 +651,7 @@ def train():
         for b in range(1, len(CAL_BINS)):
             in_bin = bin_ids == b
             if in_bin.sum() == 0:
-                cal_rows.append(
-                    {"bin": f"({CAL_BINS[b-1]:.1f},{CAL_BINS[b]:.1f}]", "count": 0, "avg_conf": np.nan, "accuracy": np.nan}
-                )
+                cal_rows.append({"bin": f"({CAL_BINS[b-1]:.1f},{CAL_BINS[b]:.1f}]", "count": 0, "avg_conf": np.nan, "accuracy": np.nan})
             else:
                 cal_rows.append(
                     {
@@ -446,22 +665,24 @@ def train():
         cal_df.to_csv(os.path.join(outdir, "calibration_bins.csv"), index=False)
         plot_calibration(cal_df, outdir)
 
-    # PCA + labeled distribution plots (TRUE labeled only)
+    # PCA + labeled distribution
     plot_pca_option_a(Xp, df, labeled_mask, outdir)
     plot_label_distribution_per_cluster(cluster_ids, df, labeled_mask, outdir)
 
-    # silhouette
     sil = silhouette_score(Xp, cluster_ids, metric="euclidean")
     pd.Series({"silhouette_full": float(sil)}).to_csv(os.path.join(outdir, "silhouette.csv"))
     print(f"Silhouette (full): {sil:.3f}")
 
     # save artifacts
     dump(preprocess, os.path.join(outdir, "preprocess.joblib"))
-    dump(sensor_cols, os.path.join(outdir, "sensor_cols.joblib"))  # for inference schema alignment
+    dump(sensor_cols, os.path.join(outdir, "sensor_cols.joblib"))
     dump(gmm, os.path.join(outdir, "gmm.joblib"))
     dump(cluster_to_label, os.path.join(outdir, "cluster_to_major_label.joblib"))
     dump(support, os.path.join(outdir, "cluster_support.joblib"))
     dump(purity, os.path.join(outdir, "cluster_purity.joblib"))
+
+    # --- CV (Mode B) ---
+    repeated_kfold_cv_self_train(df, preprocess, gmm, sensor_cols, outdir)
 
     print(f"\nSaved outputs to: {outdir}/")
 
