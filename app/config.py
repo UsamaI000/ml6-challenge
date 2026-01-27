@@ -18,8 +18,8 @@ class Settings:
     RANDOM_SEED: int = 42
 
     # Operational gates
-    CONF_THRESH: float = 0.85
-    MIN_SUPPORT: int = 4
-    MIN_PURITY: float = 0.80
+    CONF_THRESH: float = 0.98
+    MIN_SUPPORT: int = 15
+    MIN_PURITY: float = 0.90
 
 SETTINGS = Settings()
