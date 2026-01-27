@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Settings:
-    DATA_PATH: str = "./data/data_sensors.csv"
+    DATA_PATH: str = "./app/data/data_sensors.csv"
     LABEL_COL: str = "Label"
     OUTDIR: str = "baseline_outputs"
 
@@ -18,8 +18,15 @@ class Settings:
     RANDOM_SEED: int = 42
 
     # Operational gates
-    CONF_THRESH: float = 0.98
-    MIN_SUPPORT: int = 15
-    MIN_PURITY: float = 0.90
+    CONF_THRESH: float = 0.90
+    MIN_SUPPORT: int = 5
+    MIN_PURITY: float = 0.85
+
+    # Self-training (Option A)
+    SELF_TRAIN: bool = True
+    SELF_TRAIN_ITERS: int = 5              # max iterations
+    PSEUDO_CONF_THRESH: float = 0.95      # stricter than CONF_THRESH
+    PSEUDO_MAX_PER_ITER: int = 250         # cap to limit drift
+    PSEUDO_REQUIRE_RELIABLE_CLUSTER: bool = True
 
 SETTINGS = Settings()

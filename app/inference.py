@@ -32,6 +32,7 @@ class InferenceEngine:
             "cluster_to_major_label.joblib",
             "cluster_support.joblib",
             "cluster_purity.joblib",
+            "sensor_cols.joblib",
         ]
         for f in req:
             path = os.path.join(self.model_dir, f)
@@ -45,6 +46,7 @@ class InferenceEngine:
         self.cluster_to_label = load(os.path.join(self.model_dir, "cluster_to_major_label.joblib"))
         self.support = load(os.path.join(self.model_dir, "cluster_support.joblib"))
         self.purity = load(os.path.join(self.model_dir, "cluster_purity.joblib"))
+        self.sensor_cols = load(os.path.join(self.model_dir, "sensor_cols.joblib"))
 
         self.K = int(self.gmm.n_components)
 
@@ -74,12 +76,25 @@ class InferenceEngine:
         cols = sorted(cols, key=keyf)
         return cols
 
+    def _normalize_payload_to_training_cols(self, payload: dict) -> dict:
+        """
+        Map incoming payload keys (case-insensitive) onto the exact training sensor column names.
+        Missing sensors are left out -> will become NaN and be imputed by preprocess.
+        """
+        lower_map = {k.lower(): k for k in payload.keys()}  # incoming keys
+        out = {}
+        for col in self.sensor_cols:
+            src = lower_map.get(col.lower())
+            if src is not None:
+                out[col] = payload[src]
+            else:
+                out[col] = np.nan
+        return out
+        
     def predict_one(self, payload: dict) -> PredictionResult:
-        sensor_cols = self._sensor_cols_from_payload(payload)
-        if len(sensor_cols) == 0:
-            raise ValueError("Payload must include keys like 'Sensor 0', 'Sensor 1', ...")
+        Xrow = self._normalize_payload_to_training_cols(payload)
+        X = pd.DataFrame([Xrow], columns=self.sensor_cols)
 
-        X = pd.DataFrame([{c: payload[c] for c in sensor_cols}])
         Xp = self.preprocess.transform(X)
 
         cluster = int(self.gmm.predict(Xp)[0])
@@ -88,7 +103,6 @@ class InferenceEngine:
 
         pred_class = self.cluster_to_label.get(cluster, None)
 
-        # gating
         is_reliable_cluster = bool(self.reliable_cluster[cluster])
         passes_conf = conf >= SETTINGS.CONF_THRESH
         has_mapping = pred_class is not None
@@ -120,26 +134,9 @@ class InferenceEngine:
         if len(rows) == 0:
             return []
 
-        # Find union of sensor cols across rows; missing handled by imputer in preprocess
-        all_cols = set()
-        for r in rows:
-            for k in r.keys():
-                if k.lower().startswith("sensor"):
-                    all_cols.add(k)
+        Xrows = [self._normalize_payload_to_training_cols(r) for r in rows]
+        X = pd.DataFrame(Xrows, columns=self.sensor_cols)
 
-        if not all_cols:
-            raise ValueError("Batch payload must include keys like 'Sensor 0', ...")
-
-        # stable order
-        def keyf(c):
-            parts = c.split()
-            try:
-                return int(parts[-1])
-            except Exception:
-                return c
-        sensor_cols = sorted(list(all_cols), key=keyf)
-
-        X = pd.DataFrame([{c: r.get(c, np.nan) for c in sensor_cols} for r in rows])
         Xp = self.preprocess.transform(X)
 
         clusters = self.gmm.predict(Xp)

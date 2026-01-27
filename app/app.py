@@ -44,6 +44,8 @@ def model_info():
         "confidence_threshold": SETTINGS.CONF_THRESH,
         "min_support": SETTINGS.MIN_SUPPORT,
         "min_purity": SETTINGS.MIN_PURITY,
+        "self_train": SETTINGS.SELF_TRAIN,
+        "pseudo_conf_threshold": SETTINGS.PSEUDO_CONF_THRESH,
     }
 
 @app.post("/predict", response_model=PredictResponse)
