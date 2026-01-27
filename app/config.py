@@ -20,13 +20,15 @@ class Settings:
     # Operational gates
     CONF_THRESH: float = 0.85
     MIN_SUPPORT: int = 3
-    MIN_PURITY: float = 0.85
+    MIN_PURITY: float = 0.80
 
-    # Self-training (Option A)
+    # Self-training
     SELF_TRAIN: bool = True
     SELF_TRAIN_ITERS: int = 5              # max iterations
     PSEUDO_CONF_THRESH: float = 0.97      # stricter than CONF_THRESH
     PSEUDO_MAX_PER_ITER: int = 150         # cap to limit drift
     PSEUDO_REQUIRE_RELIABLE_CLUSTER: bool = True
-
+    
+    # Suggestion tier (two-tier decisions)
+    SUGGEST_CONF_THRESH: float = 0.65
 SETTINGS = Settings()

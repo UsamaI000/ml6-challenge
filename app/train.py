@@ -1,13 +1,19 @@
 # train.py
 import os
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", str(os.cpu_count() or 1))
 import numpy as np
 import pandas as pd
 from joblib import dump
 import matplotlib.pyplot as plt
 import matplotlib
-
 matplotlib.use("Agg")  # non-GUI backend
+import warnings
 
+warnings.filterwarnings(
+    "ignore",
+    message="Could not find the number of physical cores*",
+    category=UserWarning,
+)
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import RobustScaler
@@ -532,26 +538,26 @@ def train():
     labeled_ext = labeled_mask.copy()
     pseudo_labeled = pd.Series(False, index=df.index)
 
+    history_rows = []
     if getattr(SETTINGS, "SELF_TRAIN", False):
-        history_rows = []
         for it in range(int(getattr(SETTINGS, "SELF_TRAIN_ITERS", 0))):
             pred_class = pd.Series(cluster_ids).map(cluster_to_label)
 
-            reliable_cluster = compute_reliable_cluster(support, purity, K)
-            reliable_mask_all = reliable_cluster[cluster_ids]
+            # NOTE: this is "ext reliability" used only to decide what can be pseudo-labeled
+            reliable_cluster_ext = compute_reliable_cluster(support, purity, K)
+            reliable_mask_all_ext = reliable_cluster_ext[cluster_ids]
 
             pseudo_mask, pseudo_labels = select_pseudo_labels(
                 df=df,
                 labeled_mask=labeled_ext,
                 pred_class=pred_class,
                 max_prob=max_prob,
-                reliable_mask_all=reliable_mask_all,
+                reliable_mask_all=reliable_mask_all_ext,
                 exclude_mask=None,
             )
 
             n_new = int(pseudo_mask.sum())
             before = int(labeled_ext.sum())
-
             print(f"[Self-train] iter={it} pseudo_added={n_new}")
 
             if n_new == 0:
@@ -570,19 +576,30 @@ def train():
                 {"iter": it, "pseudo_added": n_new, "labeled_ext_total_before": before, "labeled_ext_total_after": after}
             )
 
+            # CRITICAL: update mapping using expanded labeled pool (true + pseudo)
             cluster_to_label, support, purity = cluster_label_mapping(cluster_ids, y_ext, labeled_ext, K)
 
         pd.DataFrame(history_rows).to_csv(os.path.join(outdir, "self_train_history.csv"), index=False)
 
+    # --- TRUE-only reliability artifacts (do NOT let pseudo labels certify reliability) ---
+    _, support_true, purity_true = cluster_label_mapping(cluster_ids, y, labeled_mask, K)
+
     # --- Final mapping + gates ---
     pred_class = pd.Series(cluster_ids).map(cluster_to_label)
-    reliable_cluster = compute_reliable_cluster(support, purity, K)
+
+    reliable_cluster = compute_reliable_cluster(support_true, purity_true, K)
     reliable_mask_all = reliable_cluster[cluster_ids]
 
-    cards = compute_cluster_cards(cluster_ids, max_prob, cluster_to_label, support, purity, K)
-    cards.to_csv(os.path.join(outdir, "cluster_cards.csv"), index=False)
+    cards_ext = compute_cluster_cards(cluster_ids, max_prob, cluster_to_label, support, purity, K)
+    cards_ext.to_csv(os.path.join(outdir, "cluster_cards_ext.csv"), index=False)
+
+    cards_true = compute_cluster_cards(cluster_ids, max_prob, cluster_to_label, support_true, purity_true, K)
+    cards_true.to_csv(os.path.join(outdir, "cluster_cards_true.csv"), index=False)
 
     auto_mask = (max_prob >= SETTINGS.CONF_THRESH) & reliable_mask_all & pred_class.notna()
+
+    suggest_thresh = float(getattr(SETTINGS, "SUGGEST_CONF_THRESH", 0.75))
+    suggest_mask = (max_prob >= suggest_thresh) & reliable_mask_all & pred_class.notna()
 
     decisions = pd.DataFrame(
         {
@@ -590,6 +607,7 @@ def train():
             "confidence": max_prob,
             "predicted_class": pred_class,
             "auto_assign": auto_mask,
+            "suggest_assign": suggest_mask,
             "is_pseudo_labeled": pseudo_labeled,
             "true_label": y,
         }
@@ -680,6 +698,8 @@ def train():
     dump(cluster_to_label, os.path.join(outdir, "cluster_to_major_label.joblib"))
     dump(support, os.path.join(outdir, "cluster_support.joblib"))
     dump(purity, os.path.join(outdir, "cluster_purity.joblib"))
+    dump(support_true, os.path.join(outdir, "cluster_support_true.joblib"))
+    dump(purity_true, os.path.join(outdir, "cluster_purity_true.joblib"))
 
     # --- CV (Mode B) ---
     repeated_kfold_cv_self_train(df, preprocess, gmm, sensor_cols, outdir)

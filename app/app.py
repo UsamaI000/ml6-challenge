@@ -1,7 +1,7 @@
 # app.py
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Optional
 
 from inference import InferenceEngine
 from config import SETTINGS
@@ -10,30 +10,36 @@ app = FastAPI(title="Sensor GMM Baseline API", version="1.0")
 
 engine: Optional[InferenceEngine] = None
 
+
 class PredictRequest(BaseModel):
-    # Generic dict allows "Sensor 0".."Sensor 19"
     features: Dict[str, float] = Field(..., description="Sensor values, e.g., {'Sensor 0': 0.12, ...}")
+
 
 class PredictResponse(BaseModel):
     cluster: int
     predicted_class: Optional[int]
     confidence: float
     auto_assign: bool
+    suggest_assign: bool
     reason: str
     cluster_support: int
     cluster_purity: Optional[float]
 
+
 class PredictBatchRequest(BaseModel):
     items: List[PredictRequest]
+
 
 @app.on_event("startup")
 def load_model():
     global engine
     engine = InferenceEngine(model_dir=SETTINGS.OUTDIR)
 
+
 @app.get("/health")
 def health():
     return {"status": "ok", "model_dir": SETTINGS.OUTDIR}
+
 
 @app.get("/model-info")
 def model_info():
@@ -42,21 +48,28 @@ def model_info():
     return {
         "K": engine.K,
         "confidence_threshold": SETTINGS.CONF_THRESH,
+        "suggest_confidence_threshold": getattr(SETTINGS, "SUGGEST_CONF_THRESH", 0.80),
         "min_support": SETTINGS.MIN_SUPPORT,
         "min_purity": SETTINGS.MIN_PURITY,
         "self_train": SETTINGS.SELF_TRAIN,
         "pseudo_conf_threshold": SETTINGS.PSEUDO_CONF_THRESH,
+        "pseudo_max_per_iter": SETTINGS.PSEUDO_MAX_PER_ITER,
+        "pseudo_require_reliable_cluster": SETTINGS.PSEUDO_REQUIRE_RELIABLE_CLUSTER,
     }
+
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(req: PredictRequest):
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
     try:
-        res = engine.predict_one(req.features)  # type: ignore
+        res = engine.predict_one(req.features)
         return PredictResponse(
             cluster=res.cluster,
             predicted_class=res.predicted_class,
             confidence=res.confidence,
             auto_assign=res.auto_assign,
+            suggest_assign=res.suggest_assign,
             reason=res.reason,
             cluster_support=res.cluster_support,
             cluster_purity=res.cluster_purity,
@@ -64,17 +77,21 @@ def predict(req: PredictRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+
 @app.post("/predict-batch", response_model=List[PredictResponse])
 def predict_batch(req: PredictBatchRequest):
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
     try:
         rows = [x.features for x in req.items]
-        results = engine.predict_batch(rows)  # type: ignore
+        results = engine.predict_batch(rows)
         return [
-        PredictResponse(
-            cluster=r.cluster,
-            predicted_class=r.predicted_class,
-            confidence=r.confidence,
-            auto_assign=r.auto_assign,
+            PredictResponse(
+                cluster=r.cluster,
+                predicted_class=r.predicted_class,
+                confidence=r.confidence,
+                auto_assign=r.auto_assign,
+                suggest_assign=r.suggest_assign,
                 reason=r.reason,
                 cluster_support=r.cluster_support,
                 cluster_purity=r.cluster_purity,
