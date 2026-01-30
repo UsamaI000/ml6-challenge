@@ -23,9 +23,6 @@ from sklearn.metrics import (
 from config import TrainConfig
 
 
-# ----------------------------
-# Helpers
-# ----------------------------
 def safe_is_not_none(arr_obj):
     return np.array([x is not None for x in arr_obj], dtype=bool)
 
@@ -105,9 +102,7 @@ def plot_curve(xs, ys, title, xlabel, ylabel, out_path: Path | None):
         plt.show()
 
 
-# ----------------------------
-# Core
-# ----------------------------
+
 def load_data(cfg: TrainConfig):
     df = pd.read_csv(cfg.csv_path)
 
