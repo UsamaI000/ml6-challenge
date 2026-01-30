@@ -1,164 +1,103 @@
-# inference.py
-import os
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Union
+
+import joblib
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass
-from joblib import load
-
-from config import SETTINGS
 
 
-@dataclass
-class PredictionResult:
+@dataclass(frozen=True)
+class Prediction:
     cluster: int
-    predicted_class: int | None
-    confidence: float
-    auto_assign: bool
-    suggest_assign: bool
-    reason: str
+    predicted_label: Optional[int]
+    gmm_confidence: float
+    cluster_purity: float
     cluster_support: int
-    cluster_purity: float | None
+    business_confidence: float
+    is_high_confidence: bool
 
 
-class InferenceEngine:
-    """
-    Loads artifacts produced by train.py and provides predict_one()/predict_batch().
-    Reliability gates are computed from TRUE-label support/purity only
-    (cluster_support_true/joblib + cluster_purity_true.joblib).
-    """
+class ModelRunner:
+    def __init__(self, bundle: Dict[str, Any]):
+        self.sensor_cols: List[str] = bundle["sensor_cols"]
+        self.scaler = bundle["scaler"]
+        self.nca = bundle["nca"]
+        self.gmm = bundle["gmm"]
+        self.best_k: int = int(bundle["best_k"])
+        self.cluster_to_label: Dict[int, Optional[int]] = bundle["cluster_to_label"]
+        self.cluster_purity_map: Dict[int, float] = bundle["cluster_purity"]
+        self.cluster_support_map: Dict[int, int] = bundle["cluster_support"]
+        self.min_support: int = int(bundle["min_support"])
+        self.min_purity: float = float(bundle["min_purity"])
+        self.conf_thresh: float = float(bundle["conf_thresh"])
 
-    def __init__(self, model_dir: str = SETTINGS.OUTDIR):
-        self.model_dir = model_dir
-        self._load_artifacts()
+        # Arrays for fast indexing
+        self.purity_arr = np.array([self.cluster_purity_map.get(c, 0.0) for c in range(self.best_k)], dtype=float)
+        self.support_arr = np.array([self.cluster_support_map.get(c, 0) for c in range(self.best_k)], dtype=int)
 
-    def _load_artifacts(self):
-        req = [
-            "preprocess.joblib",
-            "gmm.joblib",
-            "cluster_to_major_label.joblib",
-            "sensor_cols.joblib",
-            "cluster_support_true.joblib",
-            "cluster_purity_true.joblib",
-        ]
-        for f in req:
-            path = os.path.join(self.model_dir, f)
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"Missing artifact: {path}. Run `python train.py` first.")
+    @staticmethod
+    def load(model_path: str) -> "ModelRunner":
+        bundle = joblib.load(model_path)
+        return ModelRunner(bundle)
 
-        self.preprocess = load(os.path.join(self.model_dir, "preprocess.joblib"))
-        self.gmm = load(os.path.join(self.model_dir, "gmm.joblib"))
-        self.cluster_to_label = load(os.path.join(self.model_dir, "cluster_to_major_label.joblib"))
-        self.sensor_cols = load(os.path.join(self.model_dir, "sensor_cols.joblib"))
-
-        # TRUE-only reliability stats
-        self.support_true = load(os.path.join(self.model_dir, "cluster_support_true.joblib"))
-        self.purity_true = load(os.path.join(self.model_dir, "cluster_purity_true.joblib"))
-
-        self.K = int(self.gmm.n_components)
-
-        # Precompute reliable clusters gate (TRUE-only)
-        self.reliable_cluster = np.array(
-            [
-                (self.support_true.get(c, 0) >= SETTINGS.MIN_SUPPORT)
-                and (self.purity_true.get(c) is not None)
-                and (float(self.purity_true[c]) >= SETTINGS.MIN_PURITY)
-                for c in range(self.K)
-            ],
-            dtype=bool,
-        )
-
-        self.suggest_thresh = float(getattr(SETTINGS, "SUGGEST_CONF_THRESH", 0.75))
-
-    def _normalize_payload_to_training_cols(self, payload: dict) -> dict:
-        """
-        Map incoming payload keys (case-insensitive) onto the exact training sensor column names.
-        Missing sensors become NaN (then imputed by preprocess).
-        """
-        lower_map = {k.lower(): k for k in payload.keys()}
-        out = {}
-        for col in self.sensor_cols:
-            src = lower_map.get(col.lower())
-            out[col] = payload[src] if src is not None else np.nan
-        return out
-
-    def _decision_for_row(self, cluster: int, conf: float) -> tuple[bool, bool, str, int, float | None]:
-        pred_class = self.cluster_to_label.get(cluster, None)
-        has_mapping = pred_class is not None
-        is_reliable_cluster = bool(self.reliable_cluster[cluster])
-
-        cluster_support = int(self.support_true.get(cluster, 0))
-        cluster_purity = self.purity_true.get(cluster, None)
-        cluster_purity = float(cluster_purity) if cluster_purity is not None else None
-
-        auto_assign = bool(has_mapping and is_reliable_cluster and (conf >= SETTINGS.CONF_THRESH))
-        suggest_assign = bool(has_mapping and is_reliable_cluster and (conf >= self.suggest_thresh))
-
-        if not has_mapping:
-            reason = "no_cluster_to_class_mapping"
-        elif not is_reliable_cluster:
-            reason = "cluster_not_reliable_support_or_purity"
-        elif auto_assign:
-            reason = "auto_assign"
-        elif suggest_assign:
-            reason = "suggest_assign"
+    def _to_dataframe(self, x: Union[Dict[str, float], List[Dict[str, float]], pd.DataFrame]) -> pd.DataFrame:
+        if isinstance(x, pd.DataFrame):
+            df = x.copy()
+        elif isinstance(x, dict):
+            df = pd.DataFrame([x])
         else:
-            reason = "low_confidence"
+            df = pd.DataFrame(x)
 
-        return auto_assign, suggest_assign, reason, cluster_support, cluster_purity
+        missing = [c for c in self.sensor_cols if c not in df.columns]
+        if missing:
+            raise ValueError(f"Missing sensor columns: {missing}")
 
-    def predict_one(self, payload: dict) -> PredictionResult:
-        Xrow = self._normalize_payload_to_training_cols(payload)
-        X = pd.DataFrame([Xrow], columns=self.sensor_cols)
-        Xp = self.preprocess.transform(X)
+        return df[self.sensor_cols]
 
-        cluster = int(self.gmm.predict(Xp)[0])
-        probs = self.gmm.predict_proba(Xp)[0]
-        conf = float(np.max(probs))
+    def predict(self, x: Union[Dict[str, float], List[Dict[str, float]], pd.DataFrame]) -> List[Prediction]:
+        X_df = self._to_dataframe(x)
+        X = X_df.values.astype("float64")
 
-        pred_class = self.cluster_to_label.get(cluster, None)
-        auto_assign, suggest_assign, reason, cluster_support, cluster_purity = self._decision_for_row(cluster, conf)
+        X_scaled = self.scaler.transform(X)
+        Z = self.nca.transform(X_scaled)
 
-        return PredictionResult(
-            cluster=cluster,
-            predicted_class=int(pred_class) if pred_class is not None else None,
-            confidence=conf,
-            auto_assign=auto_assign,
-            suggest_assign=suggest_assign,
-            reason=reason,
-            cluster_support=cluster_support,
-            cluster_purity=cluster_purity,
-        )
+        cluster = self.gmm.predict(Z)
+        post = self.gmm.predict_proba(Z)
+        gmm_conf = post.max(axis=1)
 
-    def predict_batch(self, rows: list[dict]) -> list[PredictionResult]:
-        if len(rows) == 0:
-            return []
+        purity = self.purity_arr[cluster]
+        support = self.support_arr[cluster]
 
-        Xrows = [self._normalize_payload_to_training_cols(r) for r in rows]
-        X = pd.DataFrame(Xrows, columns=self.sensor_cols)
-        Xp = self.preprocess.transform(X)
+        # mapped label (may exist even when gate blocks it)
+        mapped = [self.cluster_to_label.get(int(c), None) for c in cluster]
 
-        clusters = self.gmm.predict(Xp)
-        probs = self.gmm.predict_proba(Xp)
-        confs = probs.max(axis=1)
+        business_conf = gmm_conf * purity
 
-        out: list[PredictionResult] = []
-        for i in range(len(rows)):
-            c = int(clusters[i])
-            conf = float(confs[i])
-            pred_class = self.cluster_to_label.get(c, None)
+        # hard gates: if not validated, force business_conf=0 and predicted_label=None
+        bad = (support < self.min_support) | (purity < self.min_purity)
+        business_conf = business_conf.copy()
+        business_conf[bad] = 0.0
 
-            auto_assign, suggest_assign, reason, cluster_support, cluster_purity = self._decision_for_row(c, conf)
+        pred_label = []
+        for i in range(len(mapped)):
+            if bad[i]:
+                pred_label.append(None)
+            else:
+                pred_label.append(mapped[i])
 
+        is_hc = business_conf >= self.conf_thresh
+
+        out: List[Prediction] = []
+        for i in range(len(cluster)):
             out.append(
-                PredictionResult(
-                    cluster=c,
-                    predicted_class=int(pred_class) if pred_class is not None else None,
-                    confidence=conf,
-                    auto_assign=auto_assign,
-                    suggest_assign=suggest_assign,
-                    reason=reason,
-                    cluster_support=cluster_support,
-                    cluster_purity=cluster_purity,
+                Prediction(
+                    cluster=int(cluster[i]),
+                    predicted_label=pred_label[i],
+                    gmm_confidence=float(gmm_conf[i]),
+                    cluster_purity=float(purity[i]),
+                    cluster_support=int(support[i]),
+                    business_confidence=float(business_conf[i]),
+                    is_high_confidence=bool(is_hc[i]),
                 )
             )
         return out

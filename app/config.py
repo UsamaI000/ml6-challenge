@@ -1,34 +1,48 @@
-# config.py
 from dataclasses import dataclass
+from pathlib import Path
+
 
 @dataclass(frozen=True)
-class Settings:
-    DATA_PATH: str = "./app/data/data_sensors.csv"
-    LABEL_COL: str = "Label"
-    OUTDIR: str = "baseline_outputs"
+class TrainConfig:
+    # Data
+    csv_path: str = "./data_sensors.csv"
+    sensor_prefix: str = "Sensor"
+    label_col: str = "Label"
 
-    # Model selection
-    K_MIN: int = 3
-    K_MAX: int = 10
-    COV_TYPE: str = "diag"
-    N_INIT: int = 10
-    MAX_ITER: int = 300
-    REG_COVAR: float = 1e-6
-    INIT_PARAMS: str = "kmeans"
-    RANDOM_SEED: int = 42
+    # NCA
+    nca_dim: int = 8
+    nca_max_iter: int = 2000
+    nca_tol: float = 1e-5
 
-    # Operational gates
-    CONF_THRESH: float = 0.85
-    MIN_SUPPORT: int = 3
-    MIN_PURITY: float = 0.80
+    # GMM selection
+    k_min: int = 3
+    k_max: int = 10
+    cov_type: str = "diag"      # "diag" or "full"
+    n_init: int = 10
+    reg_covar: float = 1e-6
 
-    # Self-training
-    SELF_TRAIN: bool = True
-    SELF_TRAIN_ITERS: int = 5              # max iterations
-    PSEUDO_CONF_THRESH: float = 0.97      # stricter than CONF_THRESH
-    PSEUDO_MAX_PER_ITER: int = 150         # cap to limit drift
-    PSEUDO_REQUIRE_RELIABLE_CLUSTER: bool = True
-    
-    # Suggestion tier (two-tier decisions)
-    SUGGEST_CONF_THRESH: float = 0.65
-SETTINGS = Settings()
+    # CV
+    cv_folds: int = 5
+    cv_seed: int = 0
+    cv_shuffle: bool = True
+
+    # Business confidence (Confidence Gating)
+    conf_thresh: float = 0.90
+    min_support: int = 5
+    min_purity: float = 0.80
+
+    # Outputs
+    artifacts_dir: str = "./app/artifacts"
+    model_filename: str = "model_bundle.joblib"
+    results_csv_name: str = "nca_gmm_bic_results.csv"
+    cv_metrics_name: str = "cv_metrics.csv"
+    final_model_selection_name: str = "final_model_selection.csv"
+    save_plots: bool = True
+
+    @property
+    def artifacts_path(self) -> Path:
+        return Path(self.artifacts_dir)
+
+    @property
+    def model_path(self) -> Path:
+        return self.artifacts_path / self.model_filename
